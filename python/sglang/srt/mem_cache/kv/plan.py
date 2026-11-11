@@ -13,10 +13,12 @@ from typing import Dict, List, Optional, Sequence, Tuple, Type
 import msgspec
 
 from sglang.srt.mem_cache.kv.decl import (
+    INDEX_K_PART,
     KV_PART,
     STATE_PART,
     DerivedPartDecl,
     FullLifetime,
+    IndexKeyGeometry,
     KVLayerDecl,
     KVLifetime,
     MHAGeometry,
@@ -35,6 +37,8 @@ from sglang.srt.mem_cache.kv.decl import (
 from sglang.srt.mem_cache.kv.layout.base import SubPoolSpec, _store_dtype_for
 from sglang.srt.mem_cache.kv.layout.composite import (
     CompositeSubPoolSpec,
+    LayerMajorRows,
+    PageBlobs,
     TokenRows,
     UnitPart,
     UnitPartGeometry,
@@ -476,25 +480,35 @@ def sub_pool_names(decls: Sequence[KVLayerDecl]) -> Tuple[str, ...]:
 
 def _needs_unit_layout(geometry: PartGeometry) -> bool:
     """Whether a geometry is laid out only inside a composite unit, even alone."""
-    return isinstance(geometry, UnitPartGeometry) and geometry.requires_unit_layout()
+    if isinstance(geometry, UnitPartGeometry):
+        return geometry.requires_unit_layout()
+    return isinstance(geometry, IndexKeyGeometry) or (
+        isinstance(geometry, MLAGeometry) and geometry.layer_major
+    )
 
 
 def _part_name(geometry: PartGeometry) -> str:
     """The name a composite sub-pool routes a geometry's layers by."""
     if isinstance(geometry, UnitPartGeometry):
         return geometry.part_name
-    return KV_PART
+    return INDEX_K_PART if isinstance(geometry, IndexKeyGeometry) else KV_PART
 
 
 def _unit_part(geometry: PartGeometry, *, name: str, layer_num: int) -> UnitPart:
     """A geometry's bytes in a composite unit."""
     if isinstance(geometry, UnitPartGeometry):
         return geometry.unit_part(name=name, layer_num=layer_num)
+    if isinstance(geometry, IndexKeyGeometry):
+        return PageBlobs(
+            name=name, layer_num=layer_num, bytes_per_token=geometry.bytes_per_token
+        )
+    if isinstance(geometry, MLAGeometry) and geometry.layer_major:
+        return LayerMajorRows(
+            name=name, layer_num=layer_num, row_bytes=geometry.row_bytes()
+        )
     # Token-major rows: their backends read one run at the token entry stride.
     if isinstance(geometry, MLAGeometry):
-        row_bytes = (
-            geometry.kv_lora_rank + geometry.qk_rope_head_dim
-        ) * geometry.kv_cache_dtype.itemsize
+        row_bytes = geometry.row_bytes()
     else:
         assert isinstance(geometry, MHAGeometry), geometry
         row_bytes = (
@@ -571,6 +585,11 @@ def _spec_for(
     fused_draft: Optional[FusedDraftPlacement],
 ) -> SubPoolSpec:
     draft_region = None if fused_draft is None else fused_draft.region(name)
+    if isinstance(geometry, MLAGeometry) and geometry.row_format is not None:
+        raise ValueError(
+            f"sub-pool {name!r}: latent rows stored as {geometry.row_format.name!r} "
+            "are read only from the layer-major layout; declare layer_major"
+        )
     if isinstance(geometry, MHAGeometry):
         return MHASubPoolSpec(
             name=name,
